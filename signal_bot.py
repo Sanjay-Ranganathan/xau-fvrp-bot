@@ -11,7 +11,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 TELEGRAM_TOKEN = "8926761913:AAFnBUk9Z3gLalt1v1Rf1WN8YgjTlvLAKXA"
 TELEGRAM_CHAT_ID = "814890629"
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(BOT_DIR, "state.json")
+STATE_FILE = os.path.join(BOT_DIR, "state", "state.json")
 BIN_SIZE = 0.5   # $0.50 bins for XAUUSD
 TICK_V = 0.10
 MAX_R = 80.0
