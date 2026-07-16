@@ -1,0 +1,45 @@
+name: FVRP Bot
+
+on:
+  schedule:
+    # Every 30 min, Mon-Fri
+    - cron: "0,30 0-23 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install requests
+
+      - name: Run bot
+        id: bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          output=$(python3 signal_bot.py 2>&1)
+          echo "$output"
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo "$output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Commit state changes
+        if: contains(steps.bot.outputs.output, 'STATE_CHANGED')
+        run: |
+          git config user.name "FVRP Bot"
+          git config user.email "bot@fvrp.local"
+          git add state/
+          git diff --staged --quiet || git commit -m "auto: update state $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
