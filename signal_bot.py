@@ -11,7 +11,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 TELEGRAM_TOKEN = "8926761913:AAFnBUk9Z3gLalt1v1Rf1WN8YgjTlvLAKXA"
 TELEGRAM_CHAT_ID = "814890629"
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(BOT_DIR, "state", "state.json")
+STATE_FILE = os.path.join(BOT_DIR, "state.json")
 BIN_SIZE = 0.5   # $0.50 bins for XAUUSD
 TICK_V = 0.10
 MAX_R = 80.0
@@ -148,7 +148,7 @@ def build_zone():
     now = datetime.now(timezone.utc)
     sk = detect_session(now)
     if not sk or not is_zone_time(now, sk):
-        return None  # silent skip — not zone time
+        return None
 
     label = LABELS.get(sk, sk)
 
@@ -157,7 +157,7 @@ def build_zone():
     today = now.date().isoformat()
     existing = zones.get(sk, {})
     if existing.get("date") == today:
-        return None  # already built today
+        return None
 
     print(f"[{now.isoformat()}] Building {sk} zone ({label})...")
 
@@ -174,9 +174,12 @@ def build_zone():
 
     if "zones" not in state: state["zones"] = {}
     if "triggered" not in state: state["triggered"] = {}
+    if "rebreak" not in state: state["rebreak"] = {}
 
     state["zones"][sk] = zone
     state["triggered"][sk] = {m["name"]: False for m in MODELS}
+    # Reset REBREAK_OPP state for this session
+    state["rebreak"][sk] = {"first_dir": None, "first_seen": False, "opp_touched": False, "took": False}
     state["price_history"] = state.get("price_history", [])
     state["last_session"] = sk
     save_state(state)
@@ -197,7 +200,7 @@ def build_zone():
     print(msg)
     return msg
 
-# ── Check breakouts ──────────────────────────────────────────────
+# ── Check breakouts (REBREAK_OPP: skip first, wait for opp test, take re-break) ─
 
 def check_breakouts():
     now = datetime.now(timezone.utc)
@@ -223,51 +226,103 @@ def check_breakouts():
     vah, val = zone["VAH"], zone["VAL"]
     lo = mid > vah
     sh_brk = mid < val
+    in_zone = not lo and not sh_brk
 
-    if not lo and not sh_brk:
-        return f"[{sk.upper()}] ${mid:.2f} in zone [${val:.2f}-${vah:.2f}]"
+    # Init rebreak state
+    if "rebreak" not in state: state["rebreak"] = {}
+    if sk not in state["rebreak"]:
+        state["rebreak"][sk] = {"first_dir": None, "first_seen": False, "opp_touched": False, "took": False}
+    rb = state["rebreak"][sk]
 
-    triggered = state.get("triggered", {}).get(sk, {})
-    signals = []
+    # Track opposite side touch (price visits the other zone level)
+    if rb["first_seen"] and not rb["opp_touched"]:
+        if rb["first_dir"] == "long":
+            # For long, opp is VAL
+            if mid <= val:
+                rb["opp_touched"] = True
+                print(f"[{now.isoformat()}] {sk}: opp side (VAL) touched, ready for re-break")
+                save_state(state)
+        elif rb["first_dir"] == "short":
+            # For short, opp is VAH
+            if mid >= vah:
+                rb["opp_touched"] = True
+                print(f"[{now.isoformat()}] {sk}: opp side (VAH) touched, ready for re-break")
+                save_state(state)
 
-    for m in MODELS:
-        name = m["name"]
-        if triggered.get(name, False): continue
+    if not in_zone:
+        breakout_dir = "long" if lo else "short"
 
-        sd = "long" if lo else "short"
-        atr_v = estimate_atr_from_history(state) or 10.0
-        trend = estimate_trend_from_history(state)
+        # Case 1: First breakout of the session — skip it (likely fakeout)
+        if not rb["first_seen"]:
+            rb["first_seen"] = True
+            rb["first_dir"] = breakout_dir
+            save_state(state)
+            print(f"[{now.isoformat()}] {sk}: first {breakout_dir} breakout — skip, waiting for opp test + re-break")
+            return None  # no signal sent
 
-        if (sd == "long" and trend <= 0) or (sd == "short" and trend >= 0):
-            continue
+        # Case 2: Already took the re-break trade — nothing more to do
+        if rb["took"]:
+            return None
 
-        sl = (mid - m["sl_atr"] * atr_v - 0.05) if sd == "long" else (mid + m["sl_atr"] * atr_v + 0.05)
-        risk_actual = abs(mid - sl)
-        pos = max(1, int(MAX_R / (int(risk_actual / TICK_V) * TICK_V)))
-        tp = mid + m["target"] * risk_actual if sd == "long" else mid - m["target"] * risk_actual
-        r_mult = abs(tp - mid) / abs(mid - sl) if abs(mid - sl) > 0 else 0
+        # Case 3: Breakout in opposite direction of first breakout — reset
+        if breakout_dir != rb["first_dir"]:
+            rb["first_dir"] = breakout_dir
+            rb["first_seen"] = True
+            rb["opp_touched"] = False
+            save_state(state)
+            print(f"[{now.isoformat()}] {sk}: direction flip to {breakout_dir} — reset, skip as first")
+            return None
 
-        signals.append(
-            f"🚨 {sk.upper()} {name}\n"
-            f"{'LONG' if sd == 'long' else 'SHORT'}  Entry: ${mid:.2f}\n"
-            f"SL: ${sl:.2f}  TP: ${tp:.2f}  R: 1:{r_mult:.1f}\n"
-            f"Size: {pos} u-lots  Risk: ${risk_actual*pos*TICK_V:.2f}"
-        )
+        # Case 4: Same direction breakout — only trade if opp side was touched
+        if rb["opp_touched"]:
+            rb["took"] = True
+            save_state(state)
 
-        if "triggered" not in state: state["triggered"] = {}
-        if sk not in state["triggered"]: state["triggered"][sk] = {}
-        state["triggered"][sk][name] = True
+            triggered = state.get("triggered", {}).get(sk, {})
+            signals = []
+            for m in MODELS:
+                name = m["name"]
+                if triggered.get(name, False): continue
 
-    if not signals:
-        return f"[{sk.upper()}] ${mid:.2f} broke zone, trend rejects"
+                atr_v = estimate_atr_from_history(state) or 10.0
+                trend = estimate_trend_from_history(state)
 
-    save_state(state)
-    # Record price for ATR/trend history
-    state["price_history"].append({"t": time.time(), "p": mid})
-    state["price_history"] = state["price_history"][-500:]
-    save_state(state)
+                if (breakout_dir == "long" and trend <= 0) or (breakout_dir == "short" and trend >= 0):
+                    continue
 
-    return "\n\n".join(signals)
+                sl = (mid - m["sl_atr"] * atr_v - 0.05) if breakout_dir == "long" else (mid + m["sl_atr"] * atr_v + 0.05)
+                risk_actual = abs(mid - sl)
+                pos = max(1, int(MAX_R / (int(risk_actual / TICK_V) * TICK_V)))
+                tp = mid + m["target"] * risk_actual if breakout_dir == "long" else mid - m["target"] * risk_actual
+                r_mult = abs(tp - mid) / abs(mid - sl) if abs(mid - sl) > 0 else 0
+
+                signals.append(
+                    f"🚨 {sk.upper()} {name}\n"
+                    f"{'LONG' if breakout_dir == 'long' else 'SHORT'}  Entry: ${mid:.2f}\n"
+                    f"SL: ${sl:.2f}  TP: ${tp:.2f}  R: 1:{r_mult:.1f}\n"
+                    f"Size: {pos} u-lots  Risk: ${risk_actual*pos*TICK_V:.2f}"
+                )
+
+                if "triggered" not in state: state["triggered"] = {}
+                if sk not in state["triggered"]: state["triggered"][sk] = {}
+                state["triggered"][sk][name] = True
+
+            if not signals:
+                return None  # trend rejects, nothing to send
+
+            save_state(state)
+            state["price_history"].append({"t": time.time(), "p": mid})
+            state["price_history"] = state["price_history"][-500:]
+            save_state(state)
+
+            return "\n\n".join(signals)
+
+        # Case 5: Same direction but opp NOT touched yet — wait
+        print(f"[{now.isoformat()}] {sk}: re-break {breakout_dir} but opp not touched — wait")
+        return None
+
+    # Price is in zone — no breakout
+    return None
 
 # ── Telegram ─────────────────────────────────────────────────────
 
